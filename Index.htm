@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,minimum-scale=1,viewport-fit=cover" />
+<title>RUN: ESCAPE 3D - Prototype</title>
+<style>
+  html,body { height:100%; margin:0; background:#05030a; color:#fff; font-family:Arial,Helvetica,sans-serif; -webkit-user-select:none; user-select:none; }
+  #gameCanvas { display:block; width:100%; height:100vh; }
+  .ui {
+    position: absolute; left:0; right:0; top:0; pointer-events:none;
+    display:flex; justify-content:space-between; padding:12px;
+    box-sizing:border-box;
+  }
+  .ui .left, .ui .right { pointer-events:auto; display:flex; gap:8px; align-items:center; }
+  .score { background:rgba(0,0,0,0.25); padding:8px 12px; border-radius:8px; font-weight:700; letter-spacing:1px; }
+  .btn {
+    background:linear-gradient(135deg,#00ffd1,#0066ff); color:#000; border-radius:10px; padding:10px 14px; font-weight:700; pointer-events:auto;
+    touch-action:none;
+  }
+  .controls {
+    position:absolute; bottom:18px; left:0; right:0; display:flex; justify-content:center; gap:12px; pointer-events:none;
+  }
+  .control-btn { width:86px; height:56px; border-radius:12px; background:rgba(255,255,255,0.06); display:flex; align-items:center; justify-content:center; font-weight:700; pointer-events:auto; }
+  .small { font-size:12px; opacity:0.85; }
+  #tapHint { position:absolute; right:12px; bottom:80px; background:rgba(0,0,0,0.25); padding:8px 10px; border-radius:8px; pointer-events:none; }
+  #gameOver { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); background:rgba(0,0,0,0.7); padding:18px; border-radius:12px; display:none; text-align:center; width:85%; }
+  #gameOver h2 { margin:0 0 8px 0; }
+  .tiny { font-size:12px; opacity:0.85; }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+
+<div class="ui">
+  <div class="left">
+    <div class="score" id="score">SCORE: 0</div>
+    <div class="score" id="coins">COINS: 0</div>
+  </div>
+  <div class="right">
+    <div class="score small" id="distance">DIST: 0m</div>
+  </div>
+</div>
+
+<div id="tapHint" class="small">Swipe ↕ pour changer de voie, ↑ pour sauter, ↓ pour glisser</div>
+
+<div class="controls">
+  <div class="control-btn btn" id="leftBtn">←</div>
+  <div class="control-btn btn" id="jumpBtn">SAUT</div>
+  <div class="control-btn btn" id="rightBtn">→</div>
+</div>
+
+<div id="gameOver">
+  <h2>GAME OVER</h2>
+  <div id="finalScore" style="font-weight:700"></div>
+  <div style="margin-top:12px;">
+    <button class="btn" id="restartBtn">REJOUER</button>
+  </div>
+  <div class="tiny" style="margin-top:8px;">Ajoute à l'écran d'accueil pour rejouer rapidement.</div>
+</div>
+
+<!-- Three.js CDN -->
+<script src="https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.min.js"></script>
+
+<script>
+/* -----------------------
+   RUN: ESCAPE 3D - Prototype
+   3 voies, obstacles procéduraux, touches + swipe.
+   ----------------------- */
+
+const canvas = document.getElementById('gameCanvas');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:true });
+renderer.setPixelRatio(window.devicePixelRatio ? Math.min(window.devicePixelRatio,2) : 1);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(0x04040a);
+
+const scene = new THREE.Scene();
+
+// Camera
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 1000);
+camera.position.set(0, 6, 12);
+camera.lookAt(0,1,0);
+
+// Light (neon look)
+const amb = new THREE.AmbientLight(0x444455, 0.9);
+scene.add(amb);
+const dir = new THREE.DirectionalLight(0xffffff, 0.3);
+dir.position.set(5,10,5);
+scene.add(dir);
+
+// Neon ground
+const groundGeo = new THREE.PlaneGeometry(30, 400, 4, 100);
+const groundMat = new THREE.MeshStandardMaterial({ color:0x070617, metalness:0.3, roughness:0.6 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI/2;
+ground.position.z = -100; // keep long runway
+scene.add(ground);
+
+// lane positions
+const lanes = [-2.5, 0, 2.5];
+const laneCount = 3;
+
+// Player
+const player = new THREE.Group();
+const bodyGeo = new THREE.BoxGeometry(1.0,1.8,1.0);
+const bodyMat = new THREE.MeshStandardMaterial({ color:0x00ffd1, emissive:0x003344, metalness:0.5, roughness:0.2 });
+const body = new THREE.Mesh(bodyGeo, bodyMat);
+body.position.y = 1;
+player.add(body);
+
+// small neon trail
+const trailGeo = new THREE.BoxGeometry(0.2,0.2,2.4);
+const trailMat = new THREE.MeshStandardMaterial({ color:0x0066ff, emissive:0x002a66, transparent:true, opacity:0.6 });
+const trail = new THREE.Mesh(trailGeo, trailMat);
+trail.position.set(0,-0.6,-1.0);
+player.add(trail);
+
+player.position.set(0,0,0);
+scene.add(player);
+
+// camera follow offset
+const camOffset = new THREE.Vector3(0,6,12);
+
+// obstacle management
+let obstacles = [];
+let pickups = [];
+let spawnTimer = 0;
+let spawnInterval = 0.9;
+let gameSpeed = 0.8; // base approach speed
+let distanceTraveled = 0;
+
+// player gameplay state
+let currentLane = 1;
+let isJumping = false;
+let vy = 0; // vertical velocity
+const gravity = -30;
+const jumpSpeed = 11;
+let isSliding = false;
+let slideTimer = 0;
+
+// score/coins
+let score = 0;
+let coins = 0;
+
+// UI elements
+const scoreEl = document.getElementById('score');
+const coinsEl = document.getElementById('coins');
+const distanceEl = document.getElementById('distance');
+const gameOverEl = document.getElementById('gameOver');
+const finalScoreEl = document.getElementById('finalScore');
+
+// touch control variables
+let touchStart = null;
+let lastTouchX = null;
+let lastTouchY = null;
+
+// helper: random neon cube
+function createObstacle(kind=0) {
+  // kind: 0 = simple block, 1 = laser swipe (thin, moving), 2 = spike pit (low)
+  const z = -120 - Math.random()*40;
+  const lane = Math.floor(Math.random()*laneCount);
+  const x = lanes[lane];
+  let mesh;
+  if (kind===0) {
+    const g = new THREE.BoxGeometry(1.8,1.8,1.8);
+    const m = new THREE.MeshStandardMaterial({ color:0xff0066, emissive:0x220011, metalness:0.2, roughness:0.7 });
+    mesh = new THREE.Mesh(g,m);
+    mesh.position.set(x,0.9,z);
+    mesh.userData.type='block';
+  } else if (kind===1) {
+    const g = new THREE.BoxGeometry(0.4,2.2,6);
+    const m = new THREE.MeshStandardMaterial({ color:0x0066ff, emissive:0x003355, transparent:true, opacity:0.9 });
+    mesh = new THREE.Mesh(g,m);
+    mesh.position.set(x,1.1,z);
+    mesh.userData.type='laser';
+    mesh.userData.osc = Math.random()*2;
+  } else {
+    const g = new THREE.BoxGeometry(2.6,0.3,2.6);
+    const m = new THREE.MeshStandardMaterial({ color:0x222222, metalness:0.4 });
+    mesh = new THREE.Mesh(g,m);
+    mesh.position.set(x,0.15,z);
+    mesh.userData.type='pit';
+  }
+  scene.add(mesh);
+  obstacles.push(mesh);
+}
+
+// pickup
+function createPickup() {
+  const z = -120 - Math.random()*40;
+  const lane = Math.floor(Math.random()*laneCount);
+  const x = lanes[lane];
+  const g = new THREE.SphereGeometry(0.5,10,10);
+  const m = new THREE.MeshStandardMaterial({ color:0xffff55, emissive:0x553300 });
+  const s = new THREE.Mesh(g,m);
+  s.position.set(x,1.2,z);
+  s.userData.type='coin';
+  scene.add(s);
+  pickups.push(s);
+}
+
+// spawn patterns
+function spawnPattern() {
+  const r = Math.random();
+  if (r < 0.55) {
+    createObstacle(0);
+  } else if (r < 0.8) {
+    createObstacle(1);
+  } else {
+    // multiple obstacles or pit
+    if (Math.random() < 0.5) {
+      createObstacle(2);
+    } else {
+      createObstacle(0);
+      if (Math.random() < 0.5) createObstacle(0);
+    }
+  }
+  if (Math.random() < 0.35) createPickup();
+}
+
+// collision simple check
+function checkCollision(obj) {
+  const dx = obj.position.x - player.position.x;
+  const dz = obj.position.z - player.position.z;
+  const dy = obj.position.y - player.position.y;
+  const dist = Math.sqrt(dx*dx + dz*dz);
+  // different checks by type
+  const t = obj.userData.type;
+  if (t==='coin') {
+    if (Math.abs(dx) < 1.0 && Math.abs(dz) < 2.0 && Math.abs(dy) < 1.6) return 'coin';
+  } else if (t==='block') {
+    if (Math.abs(dx) < 1.6 && Math.abs(dz) < 2.2 && Math.abs(player.position.y - obj.position.y) < 1.4) return 'hit';
+  } else if (t==='laser') {
+    // laser can be dodged by sliding if tall, or jumping above
+    if (Math.abs(dx) < 0.9 && Math.abs(dz) < 3.0) {
+      // oscillate to create movement
+      return (isSliding || isJumping && player.position.y > 1.2) ? null : 'hit';
+    }
+  } else if (t==='pit') {
+    // if player is on ground and in same lane x and z close => fall
+    if (Math.abs(dx) < 1.4 && Math.abs(dz) < 2.0 && player.position.y < 0.6) return 'hit';
+  }
+  return null;
+}
+
+// game over state
+let isGameOver = false;
+function gameOver() {
+  isGameOver = true;
+  finalScoreEl.innerText = `SCORE: ${Math.floor(score)}  —  DIST: ${Math.floor(distanceTraveled)}m`;
+  gameOverEl.style.display = 'block';
+}
+
+// restart
+function restartGame() {
+  // cleanup obstacles/pickups
+  obstacles.forEach(o=>scene.remove(o));
+  pickups.forEach(p=>scene.remove(p));
+  obstacles = []; pickups = [];
+  spawnTimer = 0; distanceTraveled = 0; score = 0; coins = 0;
+  scoreEl.innerText = 'SCORE: 0'; coinsEl.innerText='COINS: 0'; distanceEl.innerText='DIST: 0m';
+  player.position.set(0,0,0); currentLane = 1; isJumping=false; vy=0; isSliding=false; slideTimer=0;
+  spawnInterval = 0.9; gameSpeed = 0.8;
+  isGameOver = false;
+  gameOverEl.style.display = 'none';
+}
+
+// input handlers
+function moveLeft() { currentLane = Math.max(0, currentLane-1); }
+function moveRight() { currentLane = Math.min(laneCount-1, currentLane+1); }
+function doJump() {
+  if (!isJumping && !isSliding) {
+    vy = jumpSpeed;
+    isJumping = true;
+  }
+}
+function doSlide() {
+  if (!isJumping && !isSliding) {
+    isSliding = true;
+    slideTimer = 0.6; // seconds
+    // lower player
+    body.scale.y = 0.6;
+    body.position.y = 0.6;
+  }
+}
+
+// touch control binding
+document.getElementById('leftBtn').addEventListener('touchstart', (e)=>{ e.preventDefault(); moveLeft(); });
+document.getElementById('rightBtn').addEventListener('touchstart', (e)=>{ e.preventDefault(); moveRight(); });
+document.getElementById('jumpBtn').addEventListener('touchstart', (e)=>{ e.preventDefault(); doJump(); });
+
+// swipe detection on whole canvas
+canvas.addEventListener('touchstart', (e)=> {
+  if (e.touches.length === 0) return;
+  const t = e.touches[0];
+  touchStart = { x:t.clientX, y:t.clientY, t:Date.now() };
+  lastTouchX = t.clientX;
+  lastTouchY = t.clientY;
+});
+canvas.addEventListener('touchmove', (e)=> {
+  if (!touchStart) return;
+  const t = e.touches[0];
+  const dx = t.clientX - touchStart.x;
+  const dy = t.clientY - touchStart.y;
+  const adx = Math.abs(dx), ady = Math.abs(dy);
+  // horizontal swipe large -> left/right change
+  if (adx > 60 && adx > ady) {
+    if (dx > 0) { moveRight(); } else { moveLeft(); }
+    touchStart = null; // consume
+  } else if (ady > 60 && ady > adx) {
+    if (dy < 0) { doJump(); } else { doSlide(); }
+    touchStart = null;
+  }
+});
+canvas.addEventListener('touchend', (e)=> { touchStart = null; });
+
+// desktop fallback (keyboard)
+window.addEventListener('keydown', (e)=> {
+  if (e.key === 'ArrowLeft') moveLeft();
+  if (e.key === 'ArrowRight') moveRight();
+  if (e.key === ' ' || e.key === 'ArrowUp') doJump();
+  if (e.key === 'ArrowDown') doSlide();
+});
+
+// restart btn
+document.getElementById('restartBtn').addEventListener('click', restartGame);
+
+// main loop
+const clock = new THREE.Clock();
+function animate() {
+  const dt = Math.min(0.05, clock.getDelta());
+  if (!isGameOver) {
+    // difficulty scaling
+    spawnInterval = Math.max(0.45, 0.9 - distanceTraveled*0.0008);
+    gameSpeed = 0.8 + Math.min(1.6, distanceTraveled*0.0006);
+
+    // spawn
+    spawnTimer += dt;
+    if (spawnTimer >= spawnInterval) {
+      spawnTimer = 0;
+      spawnPattern();
+    }
+
+    // move obstacles towards player (increase z)
+    for (let i = obstacles.length-1; i >= 0; i--) {
+      const o = obstacles[i];
+      // special laser movement
+      if (o.userData.type === 'laser') {
+        o.userData.osc += dt*3;
+        o.position.x += Math.sin(o.userData.osc)*dt*0.4;
+      }
+      o.position.z += (50 * gameSpeed) * dt;
+      if (o.position.z > 20) {
+        scene.remove(o);
+        obstacles.splice(i,1);
+      } else {
+        // collision
+        const col = checkCollision(o);
+        if (col === 'hit') { gameOver(); }
+      }
+    }
+
+    // pickups
+    for (let i = pickups.length-1; i >= 0; i--) {
+      const p = pickups[i];
+      p.position.z += (50 * gameSpeed) * dt;
+      p.position.y = 1.1 + Math.sin((performance.now()*0.002) + i)*0.15;
+      if (p.position.z > 20) {
+        scene.remove(p); pickups.splice(i,1);
+      } else {
+        const col = checkCollision(p);
+        if (col === 'coin') {
+          coins += 1;
+          score += 20;
+          coinsEl.innerText = 'COINS: ' + coins;
+          scoreEl.innerText = 'SCORE: ' + Math.floor(score);
+          scene.remove(p); pickups.splice(i,1);
+        }
+      }
+    }
+
+    // progress distance
+    distanceTraveled += (gameSpeed*50) * dt * 0.02;
+    score += (gameSpeed*10) * dt;
+    scoreEl.innerText = 'SCORE: ' + Math.floor(score);
+    distanceEl.innerText = 'DIST: ' + Math.floor(distanceTraveled) + 'm';
+
+    // player lane lerp
+    const targetX = lanes[currentLane];
+    player.position.x += (targetX - player.position.x) * Math.min(1, dt*12);
+
+    // jump physics
+    if (isJumping) {
+      vy += gravity * dt;
+      player.position.y += vy * dt;
+      if (player.position.y <= 0) {
+        player.position.y = 0; vy = 0; isJumping = false;
+      }
+    }
+    // slide timer
+    if (isSliding) {
+      slideTimer -= dt;
+      if (slideTimer <= 0) {
+        isSliding = false;
+        body.scale.y = 1; body.position.y = 1;
+      }
+    }
+
+    // small trail animation
+    trail.material.opacity = 0.4 + Math.abs(Math.sin(performance.now()*0.004))*0.4;
+  }
+
+  // camera follow slight bob
+  camera.position.lerp(new THREE.Vector3(player.position.x + camOffset.x, camOffset.y, player.position.z + camOffset.z), 0.08);
+  camera.lookAt(player.position.x, player.position.y + 1.4, player.position.z - 6);
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
+// resize
+window.addEventListener('resize', ()=> {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+// initial spawn corridor
+for (let i=0;i<6;i++) spawnPattern();
+
+</script>
+</body>
+  </html>
